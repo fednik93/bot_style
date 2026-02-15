@@ -1,5 +1,3 @@
-
-
 import os
 import io
 import asyncio
@@ -633,23 +631,44 @@ async def save_capsule_callback(callback: types.CallbackQuery):
         await callback.answer("Нет текущей капсулы для сохранения.", show_alert=True)
         return
 
+    # подготовим данные, которые понадобятся при сохранении после ввода имени
     item_ids = [int(i["id"]) for i in cap["items"]]
-    name = f"Capsule {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}"
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO capsules(user_id, name, item_ids, created_at) VALUES($1,$2,$3,$4)",
-            user_id, name, item_ids, datetime.now(timezone.utc)
-        )
+    # thumbnail если есть в cap (у вас может не быть) — можно взять первый file_id
+    thumbnail = cap.get("thumbnail") or (cap.get("items")[0].get("file_id") if cap.get("items") else None)
 
-    await callback.answer("Капсула сохранена ✅")
-    # обновим pending_capsule (опционально)
-    pending_capsule[user_id].update({"saved": True, "saved_name": name})
+    # ставим pending action — text_router обработает ввод имени (save_capsule_with_name)
+    pending_action[user_id] = {
+        "action": "save_capsule_with_name",
+        "items": item_ids,
+        "thumbnail": thumbnail
+    }
+
+    # очистим клавиатуру у текущего сообщения (если нужно) и попросим имя
+    try:
+        if callback.message:
+            await bot.edit_message_reply_markup(chat_id=callback.message.chat.id, message_id=callback.message.message_id, reply_markup=None)
+    except Exception:
+        pass
+    await clear_last_menu_if_different(user_id, callback.message)
+    await bot.send_message(user_id, "Введите имя для капсулы (или /cancel чтобы отменить):")
+    await callback.answer()
 
 @dp.message(lambda m: m.text is not None)
 async def text_router(message: types.Message):
     text = (message.text or "").strip()
     lower = text.lower()
     user_id = message.from_user.id
+    # --- Глобальная отмена: /cancel должен работать в любой момент ---
+    if lower == "/cancel":
+        # снимаем все временные режимы ввода
+        pending_add.pop(user_id, None)
+        pending_action.pop(user_id, None)
+        pending_photo_offer.pop(user_id, None)
+        pending_capsule.pop(user_id, None)
+        # можно расширить на другие стейты, если нужно
+
+        await send_main_menu(user_id, "Операция отменена.")
+        return
 
     # 1) Pending actions (save_capsule_with_name, add_tag, add_desc)
     pa = pending_action.get(user_id)
@@ -694,14 +713,16 @@ async def text_router(message: types.Message):
                 """, user_id, name, items, thumbnail, datetime.now(timezone.utc))
             pending_action.pop(user_id, None)
             pending_capsule.pop(user_id, None)
-            await send_main_menu(user_id, f"Капсула <b>{escape(name)}</b> сохранена ✅ (id {row['id']}).")
+            await send_main_menu(user_id, f"Капсула <b>{escape(name)}</b> сохранена ✅")
             return
 
     # 2) pending_add states (awaiting_name / awaiting_color / wait_search_text)
     state = pending_add.get(user_id)
     # безопасно определяем stage — если state == None, stage будет None
     stage = state.get("stage") if state else None
-
+    if stage == "wait_search_text":
+        await do_search(message, user_id, text)
+        return
     if state and stage == "awaiting_name":
             # сохраняем имя и переводим в ready_to_confirm
             state["name"] = text
@@ -759,6 +780,9 @@ async def text_router(message: types.Message):
                 except Exception:
                     pass
             return
+    if stage == "wait_search_text":
+        await do_search(message, user_id, text)
+        return
     if stage == "awaiting_color":
         # пользователь ввёл цвет вручную — сопоставляем с COLOR_MAP
         color_input = text.strip()
@@ -830,7 +854,7 @@ async def text_router(message: types.Message):
         sent = await bot.send_message(user_id, "Меню гардероба:", reply_markup=wardrobe_menu_kb_dynamic())
         last_menu_message[user_id] = {"chat_id": sent.chat.id, "message_id": sent.message_id, "type": "wardrobe_menu"}
         return
-    if lower.startswith("/help") or "помощ" in lower:
+    if lower.startswith("/help") or "помощь" in lower:
         await cmd_help(message); return
     if lower == "/cancel":
         if user_id in pending_add:
@@ -843,6 +867,33 @@ async def text_router(message: types.Message):
             return
 
     await send_main_menu(user_id, "Не распознал команду. Используйте меню ниже.")
+@dp.callback_query(lambda c: c.data == "search_continue")
+async def search_continue_callback(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    # переводим пользователя в режим ввода текста для нового поиска
+    pending_add[user_id] = {"stage": "wait_search_text"}
+    try:
+        await bot.edit_message_reply_markup(chat_id=callback.message.chat.id, message_id=callback.message.message_id, reply_markup=None)
+    except Exception:
+        pass
+    await clear_last_menu_if_different(user_id, callback.message)
+    await bot.send_message(user_id, "Введи текст для поиска (название, цвет, тег, описание).", reply_markup=None)
+    await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data == "search_end")
+async def search_end_callback(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    # завершаем режим поиска
+    pending_add.pop(user_id, None)
+    try:
+        await bot.edit_message_reply_markup(chat_id=callback.message.chat.id, message_id=callback.message.message_id, reply_markup=None)
+    except Exception:
+        pass
+    await clear_last_menu_if_different(user_id, callback.message)
+    # возвращаем основное меню (или любое удобное сообщение)
+    await send_main_menu(user_id, "Поиск завершён.")
+    await callback.answer()
 
 # ---------------- Photo handler ----------------
 @dp.message(lambda m: m.photo is not None)
@@ -1910,7 +1961,6 @@ async def general_callback_router(callback: types.CallbackQuery):
 # ---------------- Search helper ----------------
 async def do_search(message: types.Message, user_id: int, query: str):
     query = (query or "").strip()
-    print(f"[DEBUG] do_search called for user={user_id!r} query={query!r}")
     if not query:
         await bot.send_message(user_id, "Пустой запрос. Введите текст или /cancel чтобы выйти.", reply_markup=None)
         return
